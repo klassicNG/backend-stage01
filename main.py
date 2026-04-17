@@ -9,11 +9,12 @@ from datetime import datetime, timezone
 from pydantic import BaseModel
 import httpx
 import asyncio
+import os
 from uuid_extensions import uuid7 # using the uuid7 package
 
 # --- 1. DATABASE SETUP ---
 # Swap this with your actual PostgreSQL URL (e.g., postgresql://user:pass@host/db)
-DATABASE_URL = "postgresql://user:password@localhost/dbname" 
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
