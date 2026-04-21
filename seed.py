@@ -19,7 +19,7 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 
 # URL to the JSON file provided in the Stage 2 instructions
-JSON_URL = "YOUR_PROVIDED_JSON_LINK_HERE" 
+JSON_URL = "https://drive.google.com/file/d/1Up06dcS9OfUEnDj_u6OV_xTRntupFhPH/view?usp=sharing" 
 
 def run_seed():
     print("Downloading seed data...")
