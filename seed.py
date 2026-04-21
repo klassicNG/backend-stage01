@@ -5,6 +5,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import insert
 from main import Base, Profile
 from datetime import datetime, timezone
+from uuid_extensions import uuid7
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -24,20 +25,14 @@ def run_seed():
         with open("seed_profiles.json", "r", encoding="utf-8") as f:
             raw_data = json.load(f)
             
-            # --- THE FIX: Unwrap the JSON object to find the array ---
-            if isinstance(raw_data, dict):
-                # Try common keys where the list might be hidden
-                profiles_data = raw_data.get("data") or raw_data.get("profiles") or raw_data.get("results")
-                
-                # If those exact keys aren't there, just grab the first list it finds
-                if not profiles_data:
-                    for val in raw_data.values():
-                        if isinstance(val, list):
-                            profiles_data = val
-                            break
-            else:
-                # If it's already a list, just use it
+            # --- TRAP 1 FIXED: Safely unwrap the "profiles" dictionary ---
+            if isinstance(raw_data, dict) and "profiles" in raw_data:
+                profiles_data = raw_data["profiles"]
+            elif isinstance(raw_data, list):
                 profiles_data = raw_data
+            else:
+                print("ERROR: Could not find the profile list in the JSON.")
+                return
                 
     except FileNotFoundError:
         print("ERROR: Could not find seed_profiles.json.")
@@ -54,9 +49,12 @@ def run_seed():
     print(f"Seeding {len(profiles_data)} profiles...")
 
     for item in profiles_data:
-        # Create an upsert statement (Idempotent)
+        # --- TRAP 2 FIXED: Generate the missing IDs and Timestamps ---
+        new_id = str(uuid7())
+        created_time = datetime.now(timezone.utc)
+
         stmt = insert(Profile).values(
-            id=item["id"],
+            id=new_id,
             name=item["name"],
             gender=item.get("gender"),
             gender_probability=item.get("gender_probability"),
@@ -65,7 +63,7 @@ def run_seed():
             country_id=item.get("country_id"),
             country_name=item.get("country_name"),
             country_probability=item.get("country_probability"),
-            created_at=datetime.fromisoformat(item["created_at"].replace("Z", "+00:00")) if item.get("created_at") else datetime.now(timezone.utc)
+            created_at=created_time
         )
         
         # On conflict (name already exists), do nothing
