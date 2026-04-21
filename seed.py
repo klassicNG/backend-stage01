@@ -1,5 +1,5 @@
 import os
-import requests
+import json
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import insert
@@ -18,17 +18,18 @@ if DATABASE_URL.startswith("postgres://"):
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 
-# URL to the JSON file provided in the Stage 2 instructions
-JSON_URL = "https://drive.google.com/file/d/1Up06dcS9OfUEnDj_u6OV_xTRntupFhPH/view?usp=sharing" 
-
 def run_seed():
-    print("Downloading seed data...")
-    response = requests.get(JSON_URL)
-    if response.status_code != 200:
-        print("Failed to download seed data.")
+    print("Loading local seed data...")
+    try:
+        # Read directly from the uploaded file
+        with open("seed_profiles.json", "r", encoding="utf-8") as f:
+            profiles_data = json.load(f)
+    except FileNotFoundError:
+        print("ERROR: Could not find profiles.json. Did you upload it to GitHub?")
         return
-    
-    profiles_data = response.json()
+    except json.JSONDecodeError:
+        print("ERROR: profiles.json is not a valid JSON file.")
+        return
 
     print("Rebuilding database schema...")
     Base.metadata.drop_all(bind=engine) # Drops the old Stage 1 table
