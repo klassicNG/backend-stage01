@@ -21,19 +21,34 @@ SessionLocal = sessionmaker(bind=engine)
 def run_seed():
     print("Loading local seed data...")
     try:
-        # Read directly from the uploaded file
         with open("seed_profiles.json", "r", encoding="utf-8") as f:
-            profiles_data = json.load(f)
+            raw_data = json.load(f)
+            
+            # --- THE FIX: Unwrap the JSON object to find the array ---
+            if isinstance(raw_data, dict):
+                # Try common keys where the list might be hidden
+                profiles_data = raw_data.get("data") or raw_data.get("profiles") or raw_data.get("results")
+                
+                # If those exact keys aren't there, just grab the first list it finds
+                if not profiles_data:
+                    for val in raw_data.values():
+                        if isinstance(val, list):
+                            profiles_data = val
+                            break
+            else:
+                # If it's already a list, just use it
+                profiles_data = raw_data
+                
     except FileNotFoundError:
-        print("ERROR: Could not find profiles.json. Did you upload it to GitHub?")
+        print("ERROR: Could not find seed_profiles.json.")
         return
     except json.JSONDecodeError:
-        print("ERROR: profiles.json is not a valid JSON file.")
+        print("ERROR: seed_profiles.json is not a valid JSON file.")
         return
 
     print("Rebuilding database schema...")
-    Base.metadata.drop_all(bind=engine) # Drops the old Stage 1 table
-    Base.metadata.create_all(bind=engine) # Creates the new Stage 2 table
+    Base.metadata.drop_all(bind=engine) 
+    Base.metadata.create_all(bind=engine) 
 
     db = SessionLocal()
     print(f"Seeding {len(profiles_data)} profiles...")
