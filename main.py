@@ -1,20 +1,21 @@
+import os
+import re
 from fastapi import FastAPI, HTTPException, Request, Depends, Query, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime
+from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, asc, desc
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
-from sqlalchemy.exc import IntegrityError
 from datetime import datetime, timezone
 from pydantic import BaseModel
-import httpx
-import asyncio
-import os
-from uuid_extensions import uuid7 # using the uuid7 package
+from typing import Optional
+from uuid_extensions import uuid7
+import pycountry
 
 # --- 1. DATABASE SETUP ---
-# Swap this with your actual PostgreSQL URL (e.g., postgresql://user:pass@host/db)
 DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -26,10 +27,10 @@ class Profile(Base):
     name = Column(String(255), unique=True, index=True, nullable=False)
     gender = Column(String(50))
     gender_probability = Column(Float)
-    sample_size = Column(Integer)
     age = Column(Integer)
     age_group = Column(String(50))
-    country_id = Column(String(10))
+    country_id = Column(String(2))
+    country_name = Column(String(255))
     country_probability = Column(Float)
     created_at = Column(DateTime(timezone=True))
 
@@ -47,156 +48,168 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Required for grading script
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # --- 3. CUSTOM ERROR HANDLING ---
-# Overrides standard FastAPI 422 to match the required schema
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=422,
-        content={"status": "error", "message": "Invalid type or missing fields"}
+        content={"status": "error", "message": "Invalid query parameters"}
     )
 
-class ProfileCreate(BaseModel):
-    name: str
+# --- 4. NLP PARSING ENGINE ---
+def parse_nl_query(q: str):
+    q = q.lower()
+    filters = {}
 
-# --- 4. ENDPOINTS ---
-
-@app.post("/api/profiles", status_code=201)
-async def create_profile(payload: ProfileCreate, db: Session = Depends(get_db)):
-    name = payload.name.strip().lower()
+    # 1. Gender 
+    has_female = bool(re.search(r'\b(female|females|women|woman|girl|girls)\b', q))
+    has_male = bool(re.search(r'\b(male|males|men|man|boy|boys)\b', q))
     
-    if not name:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "Missing or empty name"})
+    # Only filter if one is exclusively mentioned. "Male and female" cancels out.
+    if has_female and not has_male:
+        filters["gender"] = "female"
+    elif has_male and not has_female:
+        filters["gender"] = "male"
 
-    # Idempotency Check
-    existing_profile = db.query(Profile).filter(Profile.name == name).first()
-    if existing_profile:
-        return JSONResponse(
-            status_code=200, 
-            content={
-                "status": "success",
-                "message": "Profile already exists",
-                "data": {col.name: getattr(existing_profile, col.name) for col in existing_profile.__table__.columns}
-            }
-        )
+    # 2. Age Descriptors & Groups
+    if re.search(r'\byoung\b', q):
+        filters["min_age"] = 16
+        filters["max_age"] = 24
+    if re.search(r'\bteenagers?\b', q):
+        filters["age_group"] = "teenager"
+    if re.search(r'\badults?\b', q):
+        filters["age_group"] = "adult"
+    if re.search(r'\bseniors?\b', q):
+        filters["age_group"] = "senior"
+    if re.search(r'\bchild(ren)?\b', q):
+        filters["age_group"] = "child"
 
-    # Fetch APIs concurrently
-    async with httpx.AsyncClient() as client:
-        req_gender = client.get(f"https://api.genderize.io?name={name}")
-        req_age = client.get(f"https://api.agify.io?name={name}")
-        req_nat = client.get(f"https://api.nationalize.io?name={name}")
-        
-        res_gender, res_age, res_nat = await asyncio.gather(req_gender, req_age, req_nat)
+    # 3. Explicit Age Ranges
+    above_match = re.search(r'(above|over|>)\s*(\d+)', q)
+    if above_match:
+        filters["min_age"] = int(above_match.group(2))
 
-    gender_data = res_gender.json()
-    age_data = res_age.json()
-    nat_data = res_nat.json()
+    below_match = re.search(r'(below|under|<)\s*(\d+)', q)
+    if below_match:
+        filters["max_age"] = int(below_match.group(2))
 
-    # Edge Cases (502)
-    if gender_data.get("gender") is None or gender_data.get("count", 0) == 0:
-        return JSONResponse(status_code=502, content={"status": "error", "message": "Genderize returned an invalid response"})
-    
-    if age_data.get("age") is None:
-        return JSONResponse(status_code=502, content={"status": "error", "message": "Agify returned an invalid response"})
-        
-    if not nat_data.get("country"):
-        return JSONResponse(status_code=502, content={"status": "error", "message": "Nationalize returned an invalid response"})
+    # 4. Country Extraction
+    for country in pycountry.countries:
+        # Match standard name or official name
+        if re.search(r'\b' + re.escape(country.name.lower()) + r'\b', q) or \
+           (hasattr(country, 'official_name') and re.search(r'\b' + re.escape(country.official_name.lower()) + r'\b', q)):
+            filters["country_id"] = country.alpha_2
+            break
 
-    # Classification Logic
-    age = age_data["age"]
-    if age <= 12:
-        age_group = "child"
-    elif age <= 19:
-        age_group = "teenager"
-    elif age <= 59:
-        age_group = "adult"
-    else:
-        age_group = "senior"
+    if not filters:
+        return None
+    return filters
 
-    highest_prob_country = max(nat_data["country"], key=lambda x: x["probability"])
+# --- 5. ENDPOINTS ---
 
-    # Create new record
-    new_profile = Profile(
-        id=str(uuid7()),
-        name=name,
-        gender=gender_data["gender"],
-        gender_probability=gender_data["probability"],
-        sample_size=gender_data["count"],
-        age=age,
-        age_group=age_group,
-        country_id=highest_prob_country["country_id"],
-        country_probability=highest_prob_country["probability"],
-        created_at=datetime.now(timezone.utc)
-    )
+def format_profile(p):
+    return {
+        "id": p.id,
+        "name": p.name,
+        "gender": p.gender,
+        "gender_probability": p.gender_probability,
+        "age": p.age,
+        "age_group": p.age_group,
+        "country_id": p.country_id,
+        "country_name": p.country_name,
+        "country_probability": p.country_probability,
+        "created_at": p.created_at.strftime("%Y-%m-%dT%H:%M:%SZ") if p.created_at else None
+    }
 
-    db.add(new_profile)
-    db.commit()
-    db.refresh(new_profile)
-
-    # Format datetime exactly as requested: "2026-04-01T12:00:00Z"
-    response_data = {col.name: getattr(new_profile, col.name) for col in new_profile.__table__.columns}
-    response_data["created_at"] = response_data["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    return {"status": "success", "data": response_data}
-
-@app.get("/api/profiles/{profile_id}")
-async def get_profile(profile_id: str, db: Session = Depends(get_db)):
-    profile = db.query(Profile).filter(Profile.id == profile_id).first()
-    if not profile:
-        return JSONResponse(status_code=404, content={"status": "error", "message": "Profile not found"})
-    
-    data = {col.name: getattr(profile, col.name) for col in profile.__table__.columns}
-    data["created_at"] = data["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"status": "success", "data": data}
+def apply_filters(query, params):
+    if params.get("gender"):
+        query = query.filter(Profile.gender.ilike(params["gender"]))
+    if params.get("age_group"):
+        query = query.filter(Profile.age_group.ilike(params["age_group"]))
+    if params.get("country_id"):
+        query = query.filter(Profile.country_id.ilike(params["country_id"]))
+    if params.get("min_age") is not None:
+        query = query.filter(Profile.age >= params["min_age"])
+    if params.get("max_age") is not None:
+        query = query.filter(Profile.age <= params["max_age"])
+    if params.get("min_gender_probability") is not None:
+        query = query.filter(Profile.gender_probability >= params["min_gender_probability"])
+    if params.get("min_country_probability") is not None:
+        query = query.filter(Profile.country_probability >= params["min_country_probability"])
+    return query
 
 @app.get("/api/profiles")
 async def get_all_profiles(
-    gender: str = Query(None), 
-    country_id: str = Query(None), 
-    age_group: str = Query(None), 
+    gender: Optional[str] = None,
+    age_group: Optional[str] = None,
+    country_id: Optional[str] = None,
+    min_age: Optional[int] = None,
+    max_age: Optional[int] = None,
+    min_gender_probability: Optional[float] = None,
+    min_country_probability: Optional[float] = None,
+    sort_by: Optional[str] = None,
+    order: Optional[str] = "asc",
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=50),
     db: Session = Depends(get_db)
 ):
-    query = db.query(Profile)
+    q = db.query(Profile)
     
-    # Case-insensitive filtering
-    if gender:
-        query = query.filter(Profile.gender.ilike(gender))
-    if country_id:
-        query = query.filter(Profile.country_id.ilike(country_id))
-    if age_group:
-        query = query.filter(Profile.age_group.ilike(age_group))
+    # 1. Apply Filters
+    filter_params = {
+        "gender": gender, "age_group": age_group, "country_id": country_id,
+        "min_age": min_age, "max_age": max_age, 
+        "min_gender_probability": min_gender_probability, "min_country_probability": min_country_probability
+    }
+    q = apply_filters(q, filter_params)
 
-    profiles = query.all()
-    
-    data_list = []
-    for p in profiles:
-        data_list.append({
-            "id": p.id,
-            "name": p.name,
-            "gender": p.gender,
-            "age": p.age,
-            "age_group": p.age_group,
-            "country_id": p.country_id
-        })
+    # 2. Sorting
+    if sort_by in ["age", "created_at", "gender_probability"]:
+        col = getattr(Profile, sort_by)
+        q = q.order_by(desc(col) if order.lower() == "desc" else asc(col))
+
+    # 3. Pagination & Count
+    total = q.count()
+    profiles = q.offset((page - 1) * limit).limit(limit).all()
 
     return {
         "status": "success",
-        "count": len(data_list),
-        "data": data_list
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "data": [format_profile(p) for p in profiles]
     }
 
-@app.delete("/api/profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_profile(profile_id: str, db: Session = Depends(get_db)):
-    profile = db.query(Profile).filter(Profile.id == profile_id).first()
-    if not profile:
-        return JSONResponse(status_code=404, content={"status": "error", "message": "Profile not found"})
+@app.get("/api/profiles/search")
+async def search_profiles(
+    q: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db)
+):
+    if not q or not q.strip():
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Missing or empty parameter"})
+
+    filters = parse_nl_query(q)
+    if not filters:
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Unable to interpret query"})
+
+    query = db.query(Profile)
+    query = apply_filters(query, filters)
     
-    db.delete(profile)
-    db.commit()
-    return # Returns 204 No Content automatically via status_code decorator
+    total = query.count()
+    profiles = query.offset((page - 1) * limit).limit(limit).all()
+
+    return {
+        "status": "success",
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "data": [format_profile(p) for p in profiles]
+    }
