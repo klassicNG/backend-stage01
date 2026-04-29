@@ -1,37 +1,34 @@
-import csv
-from io import StringIO
-from fastapi.responses import RedirectResponse
-from fastapi.responses import StreamingResponse
-from fastapi import HTTPException, Security
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
-from fastapi.responses import RedirectResponse
-import httpx
-from uuid6 import uuid7  # The TRD strictly requires UUID v7 for users
-from datetime import datetime, timezone
-import jwt
-from datetime import datetime, timedelta, timezone
-import httpx
-from uuid_extensions import uuid7 # or however you import your UUID7 generator
-import math
-from sqlalchemy import Boolean
-import time
-import logging
 import os
 import re
-from fastapi import FastAPI, HTTPException, Request, Depends, Query, status
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, asc, desc
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
-from datetime import datetime, timezone
-from pydantic import BaseModel
+import time
+import csv
+import math
+import logging
+from io import StringIO
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Optional
-from uuid_extensions import uuid7
+
+import httpx
+import jwt
 import pycountry
 from dotenv import load_dotenv
+
+# FastAPI Core & Responses
+from fastapi import FastAPI, Request, Depends, Query, HTTPException, status, Security
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+# SQLAlchemy & Pydantic
+from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, Boolean, asc, desc
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from pydantic import BaseModel
+
+# Security & Utilities
+from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
+from uuid_extensions import uuid7  # Ensure this matches your requirements.txt!
 
 load_dotenv()  # This actively searches for the .env file and loads the variables
 
@@ -252,6 +249,44 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         status_code=422,
         content={"status": "error", "message": "Invalid query parameters"}
     )
+
+
+
+# --- Rate Limiting Configuration ---
+RATE_LIMIT_WINDOW = 60  # seconds
+MAX_REQUESTS = 30       # max requests per window
+
+# In-memory dictionary to track IP request timestamps
+request_counts = defaultdict(list)
+
+@app.middleware("http")
+async def rate_limiter_middleware(request: Request, call_next):
+    # Grab the user's IP address
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    current_time = time.time()
+    
+    # Filter out timestamps that are older than our window (60 seconds)
+    request_counts[client_ip] = [
+        timestamp for timestamp in request_counts[client_ip] 
+        if current_time - timestamp < RATE_LIMIT_WINDOW
+    ]
+    
+    # If this IP has exceeded the limit, reject the request immediately
+    if len(request_counts[client_ip]) >= MAX_REQUESTS:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "status": "error", 
+                "message": "Too Many Requests. Please slow down.",
+                "retry_after": RATE_LIMIT_WINDOW
+            }
+        )
+    
+    # Otherwise, log this request's timestamp and let it through
+    request_counts[client_ip].append(current_time)
+    
+    response = await call_next(request)
+    return response
 
 # --- 4. NLP PARSING ENGINE ---
 def parse_nl_query(q: str):
