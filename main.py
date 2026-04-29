@@ -1,3 +1,14 @@
+from fastapi import HTTPException, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
+from fastapi.responses import RedirectResponse
+import httpx
+from uuid6 import uuid7  # The TRD strictly requires UUID v7 for users
+from datetime import datetime, timezone
+import jwt
+from datetime import datetime, timedelta, timezone
+import httpx
+from uuid_extensions import uuid7 # or however you import your UUID7 generator
 import math
 from sqlalchemy import Boolean
 import time
@@ -53,7 +64,23 @@ class User(Base):
     last_login_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True))
 
-Base.metadata.create_all(bind=engine)
+# --- AUTHENTICATION UTILITIES ---
+JWT_SECRET = os.getenv("JWT_SECRET")
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
+ALGORITHM = "HS256"
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=3)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
+
+def create_refresh_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=5)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
 
 def get_db():
     db = SessionLocal()
@@ -62,8 +89,104 @@ def get_db():
     finally:
         db.close()
 
+security = HTTPBearer()
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security), db: Session = Depends(get_db)):
+    token = credentials.credentials
+    try:
+        # Crack open the token to read the payload
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    # Verify the user actually exists in the database
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    return user
+
+
+
+Base.metadata.create_all(bind=engine)
+
+
+
 # --- 2. FASTAPI APP & CORS ---
 app = FastAPI()
+
+@app.get("/auth/github")
+async def github_login():
+    # Redirect the user to GitHub to grant permission
+    github_auth_url = f"https://github.com/login/oauth/authorize?client_id={GITHUB_CLIENT_ID}&scope=read:user user:email"
+    return RedirectResponse(github_auth_url)
+
+
+@app.get("/auth/github/callback")
+async def github_callback(code: str, db: Session = Depends(get_db)):
+    # 1. Exchange the code for a GitHub access token
+    async with httpx.AsyncClient() as client:
+        token_res = await client.post(
+            "https://github.com/login/oauth/access_token",
+            headers={"Accept": "application/json"},
+            data={
+                "client_id": GITHUB_CLIENT_ID,
+                "client_secret": GITHUB_CLIENT_SECRET,
+                "code": code
+            }
+        )
+        token_data = token_res.json()
+        github_access_token = token_data.get("access_token")
+
+        if not github_access_token:
+            return JSONResponse(status_code=400, content={"status": "error", "message": "Failed to authenticate with GitHub"})
+
+        # 2. Use the token to fetch the user's GitHub profile
+        user_res = await client.get(
+            "https://api.github.com/user",
+            headers={"Authorization": f"Bearer {github_access_token}"}
+        )
+        github_user = user_res.json()
+
+        # 3. Check if we already have this user in our database
+        github_id = str(github_user["id"])
+        db_user = db.query(User).filter(User.github_id == github_id).first()
+
+        if not db_user:
+            # First time login - create new user
+            db_user = User(
+                id=str(uuid7()),
+                github_id=github_id,
+                username=github_user.get("login"),
+                email=github_user.get("email"),
+                avatar_url=github_user.get("avatar_url"),
+                role="analyst", # Default role as per TRD
+                created_at=datetime.now(timezone.utc),
+                last_login_at=datetime.now(timezone.utc)
+            )
+            db.add(db_user)
+            db.commit()
+            db.refresh(db_user)
+        else:
+            # Returning user - update last login
+            db_user.last_login_at = datetime.now(timezone.utc)
+            db.commit()
+
+        # 4. Generate our own system tokens
+        token_payload = {"sub": db_user.id, "role": db_user.role}
+        access_token = create_access_token(token_payload)
+        refresh_token = create_refresh_token(token_payload)
+
+        return {
+            "status": "success",
+            "access_token": access_token,
+            "refresh_token": refresh_token
+        }
 
 app.add_middleware(
     CORSMiddleware,
@@ -187,6 +310,18 @@ def apply_filters(query, params):
     if params.get("min_country_probability") is not None:
         query = query.filter(Profile.country_probability >= params["min_country_probability"])
     return query
+
+@app.get("/api/users/me")
+async def get_my_profile(current_user: User = Depends(get_current_user)):
+    return {
+        "status": "success",
+        "data": {
+            "id": current_user.id,
+            "username": current_user.username,
+            "email": current_user.email,
+            "role": current_user.role
+        }
+    }
 
 @app.get("/api/profiles")
 async def get_all_profiles(

@@ -7,3 +7,5 @@ uuid7
 pycountry
 requests
 slowapi
+pyjwt
+uuid6
