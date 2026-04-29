@@ -1,5 +1,6 @@
 import csv
 from io import StringIO
+from fastapi.responses import RedirectResponse
 from fastapi.responses import StreamingResponse
 from fastapi import HTTPException, Security
 from fastapi import Depends, HTTPException, status
@@ -202,11 +203,8 @@ async def github_callback(code: str, db: Session = Depends(get_db)):
         access_token = create_access_token(token_payload)
         refresh_token = create_refresh_token(token_payload)
 
-        return {
-            "status": "success",
-            "access_token": access_token,
-            "refresh_token": refresh_token
-        }
+    redirect_url = f"http://localhost:3000/callback?access_token={access_token}&refresh_token={refresh_token}&role={db_user.role}"
+    return RedirectResponse(url=redirect_url)
 
 app.add_middleware(
     CORSMiddleware,
