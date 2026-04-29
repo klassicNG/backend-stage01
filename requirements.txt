@@ -9,3 +9,4 @@ requests
 slowapi
 pyjwt
 uuid6
+python-dotenv
