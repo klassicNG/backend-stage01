@@ -142,14 +142,14 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI()
 
 @app.get("/auth/github")
-async def github_login():
-    # Redirect the user to GitHub to grant permission
-    github_auth_url = f"https://github.com/login/oauth/authorize?client_id={GITHUB_CLIENT_ID}&scope=read:user user:email"
-    return RedirectResponse(github_auth_url)
+async def github_login(source: str = "cli"): # Defaults to CLI if nothing is provided
+    # Append the state parameter to the GitHub URL
+    github_auth_url = f"https://github.com/login/oauth/authorize?client_id={GITHUB_CLIENT_ID}&state={source}"
+    return RedirectResponse(url=github_auth_url)
 
 
 @app.get("/auth/github/callback")
-async def github_callback(code: str, db: Session = Depends(get_db)):
+async def github_callback(code: str, state: str = "cli", db: Session = Depends(get_db)):
     # 1. Exchange the code for a GitHub access token
     async with httpx.AsyncClient() as client:
         token_res = await client.post(
@@ -202,9 +202,15 @@ async def github_callback(code: str, db: Session = Depends(get_db)):
         token_payload = {"sub": db_user.id, "role": db_user.role}
         access_token = create_access_token(token_payload)
         refresh_token = create_refresh_token(token_payload)
+        
+    if state == "web":
+        base_redirect = "https://insighta-web-flame.vercel.app/"
+    else:
+        base_redirect = "http://localhost:3000"
 
-    redirect_url = f"http://localhost:3000/callback?access_token={access_token}&refresh_token={refresh_token}&role={db_user.role}"
+    redirect_url = f"{base_redirect}/callback?access_token={access_token}&refresh_token={refresh_token}&role={db_user.role}"
     return RedirectResponse(url=redirect_url)
+
 
 app.add_middleware(
     CORSMiddleware,
