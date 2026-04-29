@@ -1,4 +1,8 @@
+import csv
+from io import StringIO
+from fastapi.responses import StreamingResponse
 from fastapi import HTTPException, Security
+from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 from fastapi.responses import RedirectResponse
@@ -110,6 +114,22 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Security(securi
         raise HTTPException(status_code=401, detail="User not found")
     
     return user
+
+class RoleChecker:
+    def __init__(self, allowed_roles: list[str]):
+        self.allowed_roles = allowed_roles
+
+    def __call__(self, user: User = Depends(get_current_user)):
+        if user.role not in self.allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Role '{user.role}' does not have the required permissions."
+            )
+        return user
+
+# Define specific permission levels
+allow_admin = RoleChecker(["admin"])
+allow_any_authenticated = RoleChecker(["admin", "analyst"])    
 
 
 
@@ -414,3 +434,28 @@ async def search_profiles(
         },
         "data": [format_profile(p) for p in profiles]
     }
+
+@app.get("/api/profiles/export")
+async def export_profiles_csv(
+    # This line is the bouncer. Only 'admin' passes.
+    current_user: User = Depends(allow_admin), 
+    db: Session = Depends(get_db)
+):
+    # Fetch all 2026 profiles (or whatever is in DB)
+    profiles = db.query(Profile).all()
+    
+    # Create an in-memory CSV file
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "Name", "Gender", "Age", "Country"]) # Headers
+    
+    for p in profiles:
+        writer.writerow([p.id, p.name, p.gender, p.age, p.country_name])
+    
+    output.seek(0)
+    
+    return StreamingResponse(
+        output, 
+        media_type="text/csv", 
+        headers={"Content-Disposition": "attachment; filename=profiles_export.csv"}
+    )
