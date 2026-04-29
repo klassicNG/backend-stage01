@@ -6,3 +6,4 @@ psycopg2-binary
 uuid7
 pycountry
 requests
+slowapi

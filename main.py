@@ -1,3 +1,7 @@
+import math
+from sqlalchemy import Boolean
+import time
+import logging
 import os
 import re
 from fastapi import FastAPI, HTTPException, Request, Depends, Query, status
@@ -11,6 +15,9 @@ from pydantic import BaseModel
 from typing import Optional
 from uuid_extensions import uuid7
 import pycountry
+from dotenv import load_dotenv
+
+load_dotenv()  # This actively searches for the .env file and loads the variables
 
 # --- 1. DATABASE SETUP ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -34,6 +41,18 @@ class Profile(Base):
     country_probability = Column(Float)
     created_at = Column(DateTime(timezone=True))
 
+class User(Base):
+    __tablename__ = "users"
+    id = Column(String(36), primary_key=True, index=True)
+    github_id = Column(String(255), unique=True, index=True)
+    username = Column(String(255))
+    email = Column(String(255))
+    avatar_url = Column(String(255))
+    role = Column(String(50), default="analyst") # admin or analyst
+    is_active = Column(Boolean, default=True)
+    last_login_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True))
+
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -53,6 +72,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Set up standard logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("insighta_logger")
+
+@app.middleware("http")
+async def system_middleware(request: Request, call_next):
+    start_time = time.time()
+
+    # 1. API Versioning Check (Only enforce on /api/ routes)
+    if request.url.path.startswith("/api/"):
+        if request.headers.get("X-API-Version") != "1":
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "API version header required"}
+            )
+
+    # 2. Process Request
+    response = await call_next(request)
+
+    # 3. Request Logging
+    process_time = time.time() - start_time
+    logger.info(f"Method: {request.method} | Endpoint: {request.url.path} | Status: {response.status_code} | Time: {process_time:.4f}s")
+
+    return response
+
 
 # --- 3. CUSTOM ERROR HANDLING ---
 @app.exception_handler(RequestValidationError)
@@ -146,6 +190,7 @@ def apply_filters(query, params):
 
 @app.get("/api/profiles")
 async def get_all_profiles(
+    request: Request, # <-- Added this
     gender: Optional[str] = None,
     age_group: Optional[str] = None,
     country_id: Optional[str] = None,
@@ -178,16 +223,27 @@ async def get_all_profiles(
     total = q.count()
     profiles = q.offset((page - 1) * limit).limit(limit).all()
 
+    # --- THE NEW PAGINATION SHAPE ---
+    total_pages = math.ceil(total / limit) if total > 0 else 1
+    base_path = request.url.path
+
     return {
         "status": "success",
         "page": page,
         "limit": limit,
         "total": total,
+        "total_pages": total_pages,
+        "links": {
+            "self": f"{base_path}?page={page}&limit={limit}",
+            "next": f"{base_path}?page={page+1}&limit={limit}" if page < total_pages else None,
+            "prev": f"{base_path}?page={page-1}&limit={limit}" if page > 1 else None
+        },
         "data": [format_profile(p) for p in profiles]
-    }
+    }    
 
 @app.get("/api/profiles/search")
 async def search_profiles(
+    request: Request, # <-- Added this
     q: Optional[str] = None,
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=50),
@@ -206,10 +262,20 @@ async def search_profiles(
     total = query.count()
     profiles = query.offset((page - 1) * limit).limit(limit).all()
 
+    # --- THE NEW PAGINATION SHAPE ---
+    total_pages = math.ceil(total / limit) if total > 0 else 1
+    base_path = request.url.path
+
     return {
         "status": "success",
         "page": page,
         "limit": limit,
         "total": total,
+        "total_pages": total_pages,
+        "links": {
+            "self": f"{base_path}?page={page}&limit={limit}",
+            "next": f"{base_path}?page={page+1}&limit={limit}" if page < total_pages else None,
+            "prev": f"{base_path}?page={page-1}&limit={limit}" if page > 1 else None
+        },
         "data": [format_profile(p) for p in profiles]
     }
